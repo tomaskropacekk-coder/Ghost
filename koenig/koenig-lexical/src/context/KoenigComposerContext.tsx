@@ -92,6 +92,11 @@ export interface CardConfig {
     feature?: CardConfigFeature;
     post?: CardConfigPost;
     snippets?: Snippet[];
+    stripeEnabled?: boolean;
+    // one of VISIBILITY_SETTINGS; 'none' hides card visibility settings
+    visibilitySettings?: string;
+    // card types whose visibility the backend can honour; every card when unset
+    visibilityCardTypes?: string[];
     [key: string]: unknown;
 }
 
