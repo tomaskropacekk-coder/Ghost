@@ -103,6 +103,16 @@ const POPUP_TRIGGER_SELECTOR = '[aria-haspopup][aria-expanded=true]';
 const OVERLAY_SELECTOR =
   '[role=dialog], [role=alertdialog], [role=menu], [role=listbox], [data-radix-popper-content-wrapper]';
 
+/** Whether the content beside the sidebar, after its outer element, holds a frame. */
+function hasFrameBeside(outer: Element | null | undefined): boolean {
+  for (let sibling = outer?.nextElementSibling; sibling; sibling = sibling.nextElementSibling) {
+    if (sibling.querySelector('iframe')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Whether a point is in the hot zone: the strip beneath the closed circle, as
  * wide as its footprint, from the screen's left edge down to the bottom. With
@@ -410,11 +420,13 @@ const FloatingSidebar = React.forwardRef<HTMLDivElement, FloatingSidebarProps>(
         if (event.pointerType === 'touch') {
           return;
         }
-        // Coming into this document, out of a frame such as an app's page or from beyond the
-        // window, the pointer was outside the capsule, though this document never saw it there.
+        // Beside a frame, such as an app's page, the pointer coming into this document came out
+        // of the frame, though this document never saw it there: outside the capsule. Anywhere
+        // else it may have rested where the sidebar shows, so it arms as ever.
         if (
           event.type === 'pointerover' &&
-          (event.relatedTarget === null || event.relatedTarget instanceof HTMLIFrameElement)
+          (event.relatedTarget === null || event.relatedTarget instanceof HTMLIFrameElement) &&
+          hasFrameBeside(wrapperRef.current?.parentElement)
         ) {
           hoverArmed.current = true;
         }
@@ -429,7 +441,9 @@ const FloatingSidebar = React.forwardRef<HTMLDivElement, FloatingSidebarProps>(
           parts.zone = !overOverlay && inHotZone(wrapperRef.current, event.clientX, event.clientY);
         }
         updateHover(parts);
-        if (waitingForRest.current) {
+        // It comes to rest after a move of its own, not after the events the page sends as it
+        // changes beneath a pointer that's still.
+        if (waitingForRest.current && event.type === 'pointermove') {
           window.clearTimeout(restTimer.current);
           restTimer.current = window.setTimeout(() => {
             waitingForRest.current = false;
