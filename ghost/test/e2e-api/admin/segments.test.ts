@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import sinon from 'sinon';
 import type { SpanDocument } from '../../../core/server/lib/tracing/create-tracer';
 
 const {
@@ -10,10 +9,7 @@ const {
   matchers,
   mockManager,
 } = require('../../utils/e2e-framework');
-// Required, not imported, so the test uses the instances Ghost runs with.
-const logging = require('@tryghost/logging');
 const models = require('../../../core/server/models');
-const settingsCache: typeof import('../../../core/shared/settings-cache') = require('../../../core/shared/settings-cache');
 
 const { anyContentLength, anyContentVersion, anyErrorId, anyEtag, anyLocationFor } = matchers;
 const { cacheInvalidateHeaderNotSet } = assertions;
@@ -88,31 +84,10 @@ describe('Segments Admin API', function () {
       .expectStatus(200);
   }
 
-  /** `shared_views` as the settings API returns it to Admin. */
-  async function readSharedViews() {
-    const { body } = await agent.get('settings/').expectStatus(200);
-    return body.settings.find((setting) => setting.key === 'shared_views')?.value;
-  }
-
   /** `shared_views` as it is stored. */
   async function storedSharedViews() {
     const row = await models.Base.knex('settings').where('key', 'shared_views').first('value');
     return row?.value;
-  }
-
-  /**
-   * `shared_views` as the settings API returns it, once that matches what is stored. A segment
-   * write refreshes the settings cache, which the settings API reads, shortly after it commits.
-   */
-  async function settledSharedViews() {
-    return vi.waitFor(
-      async () => {
-        const returned = await readSharedViews();
-        assert.equal(returned, await storedSharedViews());
-        return returned;
-      },
-      { timeout: 5000, interval: 20 },
-    );
   }
 
   async function browse() {
@@ -175,10 +150,10 @@ describe('Segments Admin API', function () {
     property: 'name',
   };
   const NAME_EMPTY = { property: 'body.segments.0.name', message: 'Name cannot be empty' };
-  const SAVED_VIEWS_INVALID = {
+  const FILTER_TAKEN = {
     type: 'ValidationError',
-    context: 'Cannot modify saved views because shared_views is invalid',
-    property: null,
+    context: 'A view with this filter already exists',
+    property: 'filter',
   };
 
   beforeAll(async function () {
@@ -188,13 +163,12 @@ describe('Segments Admin API', function () {
   });
 
   afterEach(async function () {
-    // A refresh still to come from this test's last write would otherwise land after the reset.
-    await settledSharedViews();
+    await models.Base.knex('segments').del();
     await saveSharedViews('[]');
   });
 
   describe('GET /segments/', function () {
-    it('returns no segments when no views are saved', async function () {
+    it('returns no segments when none are saved', async function () {
       await agent
         .get('segments/')
         .expectStatus(200)
@@ -202,13 +176,8 @@ describe('Segments Admin API', function () {
         .matchBodySnapshot();
     });
 
-    it('lists the member views saved through the settings API', async function () {
-      await saveSharedViews(
-        JSON.stringify([
-          { name: 'Drafts', route: 'posts', filter: { type: 'draft' } },
-          memberView('VIP', 'label:vip'),
-        ]),
-      );
+    it('lists the segments', async function () {
+      await add('VIP', 'label:vip');
 
       await agent
         .get('segments/')
@@ -247,7 +216,7 @@ describe('Segments Admin API', function () {
       assert.equal((await browse())[0].name, 'VIP');
     });
 
-    it('rejects a name another member view has, ignoring case and whitespace', async function () {
+    it('rejects a name another segment has, ignoring case and whitespace', async function () {
       await add('VIP', 'label:vip');
 
       await agent
@@ -259,12 +228,12 @@ describe('Segments Admin API', function () {
       assert.equal((await browse()).length, 1);
     });
 
-    it('rejects the name of a member view that has no filter', async function () {
-      await saveSharedViews(
-        JSON.stringify([{ name: 'Everyone', route: 'members', filter: { filter: '' } }]),
-      );
+    it("rejects a name the database counts as another segment's", async function () {
+      // Names are compared ignoring case, and MySQL's default collation also ignores accents.
+      await add('Cafe', 'label:cafe');
 
-      assert.deepEqual(await addError({ name: 'everyone', filter: 'status:free' }), NAME_TAKEN);
+      assert.deepEqual(await addError({ name: 'Café', filter: 'label:accent' }), NAME_TAKEN);
+      assert.equal((await browse()).length, 1);
     });
 
     it('accepts the name of a posts view', async function () {
@@ -319,6 +288,18 @@ describe('Segments Admin API', function () {
       });
     });
 
+    it('rejects a filter longer than the table holds', async function () {
+      // The column holds 65535 bytes, and "é" is two bytes.
+      assert.equal((await add('Long', 'x'.repeat(65535))).filter.length, 65535);
+      assert.deepEqual(
+        await addBodyError({ segments: [{ name: 'Longer', filter: 'é'.repeat(32768) }] }),
+        {
+          property: 'body.segments.0.filter',
+          message: 'Filter cannot be longer than 65535 bytes',
+        },
+      );
+    });
+
     it.each([
       ['no segments key', {}],
       ['an empty segments array', { segments: [] }],
@@ -355,6 +336,21 @@ describe('Segments Admin API', function () {
 
     it('accepts a filter it does not check against members', async function () {
       assert.equal((await add('Odd', 'not a real field:yes')).filter, 'not a real field:yes');
+    });
+
+    it('rejects a filter that another request adds at the same time', async function () {
+      const responses = await Promise.all(
+        ['One', 'Two'].map((name) =>
+          agent.post('segments/').body({ segments: [{ name, filter: 'label:same' }] }),
+        ),
+      );
+
+      const rejected = responses.flatMap(({ body }) => body.errors ?? []);
+      assert.deepEqual(
+        rejected.map(({ type, context, property }) => ({ type, context, property })),
+        [FILTER_TAKEN],
+      );
+      assert.equal((await browse()).length, 1);
     });
 
     it('keeps every segment added at the same time', async function () {
@@ -419,7 +415,7 @@ describe('Segments Admin API', function () {
       assert.equal((await rename(id, ' vip ')).name, 'vip');
     });
 
-    it('rejects a name another member view has', async function () {
+    it('rejects a name another segment has', async function () {
       await add('VIP', 'label:vip');
       const { id } = await add('Gold', 'label:gold');
 
@@ -448,7 +444,6 @@ describe('Segments Admin API', function () {
 
     it('rejects a different filter, and changes nothing', async function () {
       const { id } = await add('VIP', 'label:vip');
-      const before = await settledSharedViews();
 
       await agent
         .put(`segments/${id}/`)
@@ -457,7 +452,6 @@ describe('Segments Admin API', function () {
         .matchHeaderSnapshot(writeHeaders)
         .matchBodySnapshot(errorBody);
       assert.deepEqual(await browse(), [{ id, name: 'VIP', filter: 'label:vip' }]);
-      assert.equal(await settledSharedViews(), before);
     });
 
     it('rejects a field it does not know, rather than renaming the segment', async function () {
@@ -507,188 +501,25 @@ describe('Segments Admin API', function () {
     });
   });
 
-  describe('saved views in shared_views', function () {
-    it('saves a segment as Admin saves a view, which the settings API returns', async function () {
-      await add('VIP', 'label:vip');
+  describe('the saved views setting', function () {
+    const postsView = { name: 'Drafts', route: 'posts', filter: { type: 'draft' }, color: 'blue' };
 
-      assert.equal(await settledSharedViews(), JSON.stringify([memberView('VIP', 'label:vip')]));
+    it('leaves the setting, which holds the views of the posts list, as it is', async function () {
+      const stored = JSON.stringify([postsView]);
+      await saveSharedViews(stored);
+
+      const { id } = await add('VIP', 'label:vip');
+      await rename(id, 'Gold');
+      await agent.delete(`segments/${id}/`).expectStatus(204);
+
+      assert.equal(await storedSharedViews(), stored);
     });
 
-    it('keeps posts views, other entries and unknown keys through every change', async function () {
-      const postsView = {
-        name: 'Drafts',
-        route: 'posts',
-        color: 'midgrey',
-        filter: { type: 'draft' },
-      };
-      const unnamed = { name: 42, route: 'members', filter: { filter: 'status:paid' } };
-      const noFilter = { name: 'Everyone', route: 'members', filter: { filter: '' } };
-      const vip = {
-        name: 'VIP',
-        route: 'members',
-        color: 'yellow',
-        filter: { filter: 'label:vip', search: null },
-        pinned: true,
-      };
-      const views: unknown[] = [postsView, 'not a view', vip, unnamed, noFilter];
-      await saveSharedViews(JSON.stringify(views));
+    it('does not list a member view saved through the settings API', async function () {
+      await saveSharedViews(JSON.stringify([postsView, memberView('VIP', 'label:vip')]));
 
-      const [listed] = await browse();
-      assert.deepEqual(listed, { id: listed.id, name: 'VIP', filter: 'label:vip' });
-
-      await add('Free', 'status:free');
-      assert.equal(
-        await settledSharedViews(),
-        JSON.stringify([...views, memberView('Free', 'status:free')]),
-      );
-
-      await rename(listed.id, 'Very important');
-      assert.equal(
-        await settledSharedViews(),
-        JSON.stringify([
-          postsView,
-          'not a view',
-          { ...vip, name: 'Very important' },
-          unnamed,
-          noFilter,
-          memberView('Free', 'status:free'),
-        ]),
-      );
-
-      await agent.delete(`segments/${listed.id}/`).expectStatus(204);
-      assert.equal(
-        await settledSharedViews(),
-        JSON.stringify([
-          postsView,
-          'not a view',
-          unnamed,
-          noFilter,
-          memberView('Free', 'status:free'),
-        ]),
-      );
-    });
-
-    it('gives views that share a filter different ids', async function () {
-      await saveSharedViews(
-        JSON.stringify([
-          memberView('VIP', 'label:vip'),
-          memberView('VIP again', 'label:vip'),
-          // Filters that look like what a second view with the same filter is identified by.
-          memberView('Array', JSON.stringify(['label:vip', 2])),
-          memberView('Newline', 'label:vip\n2'),
-        ]),
-      );
-
-      await agent
-        .get('segments/')
-        .expectStatus(200)
-        .matchHeaderSnapshot(readHeaders)
-        .matchBodySnapshot();
-
-      const segments = await browse();
-      assert.equal(new Set(segments.map((segment) => segment.id)).size, 4);
-      await rename(segments[1].id, 'Second');
-      assert.deepEqual(
-        (await browse()).map((segment) => segment.name),
-        ['VIP', 'Second', 'Array', 'Newline'],
-      );
-    });
-
-    it('lists no segments when shared_views has no value, and saves an array on a write', async function () {
-      await saveSharedViews(null);
       assert.deepEqual(await browse(), []);
-
-      await add('VIP', 'label:vip');
-      assert.equal(await settledSharedViews(), JSON.stringify([memberView('VIP', 'label:vip')]));
-    });
-
-    it.each(['{}', '""', 'null'])(
-      'lists no segments when shared_views is %s, and saves an array on a write',
-      async function (empty) {
-        await saveSharedViews(empty);
-        assert.deepEqual(await browse(), []);
-
-        await add('Gold', 'label:gold');
-        assert.equal(
-          await settledSharedViews(),
-          JSON.stringify([memberView('Gold', 'label:gold')]),
-        );
-      },
-    );
-
-    describe.each([
-      ['not valid JSON', `[${JSON.stringify(memberView('VIP', 'label:vip'))}`],
-      ['an object with keys', JSON.stringify(memberView('VIP', 'label:vip'))],
-      ['a string with text', JSON.stringify('VIP')],
-    ])('when shared_views is %s', function (_description, stored) {
-      afterEach(function () {
-        sinon.restore();
-      });
-
-      it('lists no segments, and logs that they could not be read', async function () {
-        await saveSharedViews(stored);
-        const warn = sinon.spy(logging, 'warn');
-
-        assert.deepEqual(await browse(), []);
-
-        sinon.assert.calledOnceWithExactly(
-          warn,
-          { event: { name: 'segments.read-saved-views.invalid' } },
-          'Saved member views could not be read because shared_views is invalid',
-        );
-      });
-
-      it('rejects every change, and leaves the value as it is', async function () {
-        await saveSharedViews(stored);
-
-        await agent
-          .post('segments/')
-          .body({ segments: [{ name: 'Gold', filter: 'label:gold' }] })
-          .expectStatus(422)
-          .matchHeaderSnapshot(writeHeaders)
-          .matchBodySnapshot(errorBody);
-        assert.deepEqual(await renameError(UNKNOWN_ID, { name: 'Gold' }), SAVED_VIEWS_INVALID);
-        assert.deepEqual(
-          await validationError(agent.delete(`segments/${UNKNOWN_ID}/`)),
-          SAVED_VIEWS_INVALID,
-        );
-
-        assert.equal(await readSharedViews(), stored);
-      });
-    });
-
-    it('rejects a change that would make the saved views longer than the setting holds', async function () {
-      await add('VIP', 'label:vip');
-      const before = await settledSharedViews();
-
-      assert.deepEqual(await addError({ name: 'Long', filter: 'x'.repeat(65535) }), {
-        type: 'ValidationError',
-        context:
-          'Value in [settings.value] exceeds maximum length of 65535 characters. settings.value',
-        property: null,
-      });
-      assert.equal(await settledSharedViews(), before);
-    });
-
-    it('leaves the settings cache entry as a settings save leaves it', async function () {
-      await saveSharedViews(JSON.stringify([memberView('Free', 'status:free')]));
-      const saved = settingsCache.get('shared_views', { resolve: false });
-
-      await add('VIP', 'label:vip');
-      await settledSharedViews();
-      const written = settingsCache.get('shared_views', { resolve: false });
-
-      assert.ok(saved && written);
-      assert.deepEqual(Object.keys(written).sort(), Object.keys(saved).sort());
-      assert.ok(written.created_at instanceof Date && written.updated_at instanceof Date);
-      assert.deepEqual(
-        { ...written, value: saved.value, updated_at: saved.updated_at },
-        { ...saved },
-      );
-      assert.equal(
-        written.value,
-        JSON.stringify([memberView('Free', 'status:free'), memberView('VIP', 'label:vip')]),
-      );
+      assert.equal((await add('VIP', 'label:vip')).name, 'VIP');
     });
   });
 
@@ -725,7 +556,6 @@ describe('Segments Admin API', function () {
 
       await addError({ name: 'vip', filter: 'label:gold' });
       await addError({ name: 'Gold', filter: 'label:vip' });
-      await addError({ name: 'Long', filter: 'x'.repeat(65535) });
       await renameError(id, { name: 'Free' });
       await renameError(id, { name: 'VIP', filter: 'label:gold' });
       await agent
@@ -741,7 +571,6 @@ describe('Segments Admin API', function () {
       expect(failedSpans('add')).toMatchObject([
         rejected('ValidationError', 'name_taken'),
         rejected('ValidationError', 'filter_taken'),
-        rejected('ValidationError', 'stored_views_too_long'),
       ]);
       expect(failedSpans('edit')).toMatchObject([
         rejected('ValidationError', 'name_taken'),
@@ -751,15 +580,14 @@ describe('Segments Admin API', function () {
       expect(failedSpans('delete')).toMatchObject([rejected('NotFoundError', 'not_found')]);
     });
 
-    it('records a failure, not a rejection, when shared_views is invalid', async function () {
-      await saveSharedViews(JSON.stringify('VIP'));
+    it('records a name the database counts as taken as a rejection', async function () {
+      await add('Cafe', 'label:cafe');
 
-      await addError({ name: 'Gold', filter: 'label:gold' });
+      await addError({ name: 'Café', filter: 'label:accent' });
 
-      expect(spans('add')).toMatchObject([
-        { event: { outcome: 'failure' }, error: { type: 'ValidationError' } },
+      expect(failedSpans('add')).toMatchObject([
+        { error: { type: 'ValidationError' }, labels: { rejection: 'name_taken' } },
       ]);
-      assert.equal(spans('add')[0].labels.rejection, undefined);
     });
 
     it('marks a rename to the same name as unchanged', async function () {

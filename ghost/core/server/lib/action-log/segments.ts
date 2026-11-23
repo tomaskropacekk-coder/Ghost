@@ -10,9 +10,10 @@ const SettingRow = z.object({ id: z.string(), key: z.string(), group: z.string()
  * Logs the changes the segments service reports. This is the only place that knows how a segment
  * change reads in Admin's History; the service only says what happened.
  *
- * Segments are stored in the setting with `settingKey`, and History has always shown a change
- * to them as an edit of that setting, as a settings save records it. Adding, renaming and
- * deleting a segment all read that way, named after the setting's key.
+ * Segments were first stored in the setting with `settingKey`, as Admin's saved member views, and
+ * History has always shown a change to them as an edit of that setting, as a settings save
+ * records it. Adding, renaming and deleting a segment still read that way, named after the
+ * setting's key, now that segments have a table of their own.
  */
 export function recordSegmentChanges(actionLog: ActionLog, settingKey: string): OnSegmentUpdated {
   return async (trx, context) => {

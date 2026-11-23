@@ -13,7 +13,7 @@ export interface SegmentRepository {
   list(executor: Knex): Promise<Segment[]>;
   /** The segment with `id`, if there is one. */
   find(id: string, executor: Knex): Promise<Segment | undefined>;
-  /** The segment with `id`, if there is one. Other writes to segments wait until `trx` ends. */
+  /** The segment with `id`, if there is one, with its row locked until `trx` ends. */
   findForUpdate(id: string, trx: Knex.Transaction): Promise<Segment | undefined>;
   /** Stores a new segment after the others, and returns it. */
   insert(
