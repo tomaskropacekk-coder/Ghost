@@ -413,8 +413,8 @@ describe('Members saved views', () => {
       await expect(settingsApi).toHaveEditedSettings([
         {
           key: 'shared_views',
+          // The setting holds the views of the posts list alone: a member view is a segment.
           value: JSON.stringify([
-            vips,
             {
               name: 'Members only',
               route: 'posts',
