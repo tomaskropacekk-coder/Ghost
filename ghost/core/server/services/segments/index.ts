@@ -3,7 +3,6 @@ import { ActionLog } from '../../lib/action-log/action-log';
 import { recordSegmentChanges } from '../../lib/action-log/segments';
 import { tracer } from '../../lib/tracing';
 import { SegmentsService } from './service';
-import { TableSegmentRepository } from './table-repository';
 import { segmentsTracking } from './tracking';
 
 /** The setting segments were stored in, as Admin's saved member views, which History names. */
@@ -15,7 +14,6 @@ export default defineService('Segments', () => {
 
   return new SegmentsService({
     knex: db.knex,
-    repository: new TableSegmentRepository(),
     tracking: segmentsTracking({ tracer }),
     // Each change is logged as a staff action inside the command that made it.
     onSegmentUpdated: recordSegmentChanges(new ActionLog(), HISTORY_SETTING_KEY),

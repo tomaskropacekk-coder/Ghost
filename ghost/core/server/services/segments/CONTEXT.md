@@ -12,10 +12,11 @@ _Avoid_: Saved member view, when talking about the server
 What Admin's members list calls a segment. Segments were first stored as entries of the `shared_views` setting, which the posts list's saved views still use. A migration moved them to the `segments` table, and the service no longer reads or writes the setting: a member view written to it through the settings API is not a segment.
 
 **Segment id**:
-The first 24 hex characters of the SHA-256 hash of the segment's filter, which is the id a saved member view had before it had a row. `table-repository.ts` defines it. Callers treat it as opaque.
+The first 24 hex characters of the SHA-256 hash of the segment's filter, which is the id a saved member view had before it had a row. `service.ts` defines it. Callers treat it as opaque.
 
-**Segment repository**:
-Where segments are stored, behind the `SegmentRepository` interface. `TableSegmentRepository` stores them as rows of the `segments` table, in the order of the table's sortable collection. It rejects a name or a new segment's filter that another segment has.
+## Storage
+
+Segments are rows of the `segments` table, in the order of the table's sortable collection. The service reads and writes the table itself, with Knex. It rejects a name or a new segment's filter that another segment has.
 
 ## Names
 
