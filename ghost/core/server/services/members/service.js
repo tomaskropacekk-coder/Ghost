@@ -214,14 +214,6 @@ module.exports = {
 
   config: membersConfig,
 
-  browse(options) {
-    // A newest-first scan can be slower when few recent members match.
-    return membersApi.memberBREADService.browse({
-      ...options,
-      hintFreeSubscriberPage: config.get('optimization:members:hintFreeSubscriberPage') === true,
-    });
-  },
-
   get api() {
     return membersApi;
   },

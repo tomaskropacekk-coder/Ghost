@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import configUtils from '../../utils/config-utils';
 
 const { agentProvider, fixtureManager } = require('../../utils/e2e-framework');
 const ObjectId = require('bson-objectid');
@@ -274,76 +273,25 @@ describe('Members filtering, every operator admin can emit', function () {
 
         const filter = encodeURIComponent('(subscribed:true+email_disabled:0)+status:free');
         const query = `members/?filter=${filter}&include=labels,tiers&order=created_at+desc`;
-        const configKey = 'optimization:members:hintFreeSubscriberPage';
-        const originalSetting = configUtils.config.get(configKey);
         const statements: string[] = [];
         const capture = ({ sql }: { sql: string }) => statements.push(sql);
-
-        async function browseCapturingMemberQueries(url: string) {
-          statements.length = 0;
-          db.on('query', capture);
-          try {
-            const { body } = await agent.get(url).expectStatus(200);
-            const queries = statements.filter(
-              (sql) => sql.includes('from `members`') && sql.includes('`newsletters`.`status`'),
-            );
-            return { body, queries };
-          } finally {
-            db.off('query', capture);
-          }
-        }
-
-        assert.equal(originalSetting, false);
+        db.on('query', capture);
         let initial;
-        let first;
-        let second;
         try {
-          const baseline = await browseCapturingMemberQueries(`${query}&limit=100`);
-          assert.equal(baseline.queries.length, 2);
-          assert.ok(baseline.queries.every((sql) => !sql.includes('NO_SEMIJOIN')));
-
-          configUtils.set(configKey, true);
-          initial = await browseCapturingMemberQueries(`${query}&limit=100`);
-          assert.equal(initial.queries.length, 2);
-          assert.ok(!initial.queries[0].includes('NO_SEMIJOIN'));
-          assert.ok(initial.queries[1].includes('NO_SEMIJOIN(@`select#2`)'));
-          assert.deepEqual(initial.body, baseline.body);
-
-          for (const url of [
-            `${query}&limit=100&page=11`,
-            `${query}&limit=100&fields=id,email`,
-            `members/?filter=${filter}&order=email+asc&limit=100`,
-            `members/?filter=${encodeURIComponent('subscribed:true+label:vip')}&order=created_at+desc&limit=100`,
-          ]) {
-            const { queries } = await browseCapturingMemberQueries(url);
-            assert.ok(queries.length > 0, url);
-            assert.ok(
-              queries.every((sql) => !sql.includes('NO_SEMIJOIN')),
-              url,
-            );
-          }
-          statements.length = 0;
-          db.on('query', capture);
-          try {
-            await models.Member.findPage({
-              filter: 'email_disabled:0+newsletters.status:active+status:free',
-              order: 'created_at desc',
-              limit: 'all',
-              hintFreeSubscriberPage: true,
-            });
-          } finally {
-            db.off('query', capture);
-          }
-          assert.ok(statements.some((sql) => sql.includes('`newsletters`.`status`')));
-          assert.ok(statements.every((sql) => !sql.includes('NO_SEMIJOIN')));
-
-          first = await browseCapturingMemberQueries(`${query}&limit=1`);
-          second = await browseCapturingMemberQueries(`${query}&limit=1&page=2`);
-          assert.ok(second.queries[1].includes('NO_SEMIJOIN(@`select#2`)'));
+          initial = await agent.get(`${query}&limit=100`).expectStatus(200);
         } finally {
-          configUtils.set(configKey, originalSetting);
+          db.off('query', capture);
         }
 
+        const count = statements.find((sql) =>
+          sql.startsWith('select count(*) as aggregate from `members`'),
+        );
+        assert.ok(count);
+        assert.ok(count.includes('exists (select 1 from `members_newsletters`'));
+        assert.ok(!count.includes('join `newsletters`'));
+
+        const first = await agent.get(`${query}&limit=1`).expectStatus(200);
+        const second = await agent.get(`${query}&limit=1&page=2`).expectStatus(200);
         assert.deepEqual(
           initial.body.members.map((member: { email: string }) => member.email),
           [multiNewsletterEmail, ALICE],
@@ -362,6 +310,16 @@ describe('Members filtering, every operator admin can emit', function () {
         assert.equal(first.body.meta.pagination.next, 2);
         assert.equal(second.body.meta.pagination.total, 2);
         assert.equal(second.body.meta.pagination.next, null);
+
+        const activeNewsletters = await db('newsletters').where({ status: 'active' }).pluck('id');
+        await db('newsletters').whereIn('id', activeNewsletters).update({ status: 'archived' });
+        try {
+          const { body } = await agent.get(`${query}&limit=100`).expectStatus(200);
+          assert.deepEqual(body.members, []);
+          assert.equal(body.meta.pagination.total, 0);
+        } finally {
+          await db('newsletters').whereIn('id', activeNewsletters).update({ status: 'active' });
+        }
       } finally {
         await db('members').whereIn('email', [multiNewsletterEmail, archivedOnly]).del();
       }

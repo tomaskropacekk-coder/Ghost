@@ -81,39 +81,12 @@ function applyDeferredJoinForDeepOffset(qb) {
     .innerJoin(idSubquery.as('deep_page'), 'members.id', 'deep_page.deep_page_id');
 }
 
-// The Admin filter `(subscribed:true+email_disabled:0)+status:free` compiles
-// to this single newsletter subquery. Match the whole page query so a change
-// in SQL shape leaves MySQL's default plan in place.
-const FREE_SUBSCRIBER_PAGE_SQL =
+const FREE_SUBSCRIBER_FILTER = '(subscribed:true+email_disabled:0)+status:free';
+const FREE_SUBSCRIBER_SQL =
   'select * from `members` where ((`members`.`email_disabled` = ? and `members`.`id` in (' +
   'select `members_newsletters`.`member_id` from `members_newsletters` ' +
   'inner join `newsletters` on `newsletters`.`id` = `members_newsletters`.`newsletter_id` ' +
-  'where `newsletters`.`status` = ?)) and `members`.`status` = ?) ' +
-  'order by `members`.`created_at` DESC limit ?';
-
-function hintFreeSubscriberPage(qb, columns) {
-  if (
-    columns?.length !== 1 ||
-    columns[0] !== 'members.*' ||
-    !['mysql', 'mysql2'].includes(qb.client.config.client)
-  ) {
-    return;
-  }
-
-  const { sql, bindings } = qb.toSQL();
-  const [emailDisabled, newsletterStatus, memberStatus, limit] = bindings;
-  if (
-    (sql === FREE_SUBSCRIBER_PAGE_SQL || sql === FREE_SUBSCRIBER_PAGE_SQL + ' offset ?') &&
-    emailDisabled === 0 &&
-    newsletterStatus === 'active' &&
-    memberStatus === 'free' &&
-    Number.isInteger(limit) &&
-    limit > 0 &&
-    limit <= 100
-  ) {
-    qb.hintComment('NO_SEMIJOIN(@`select#2`)');
-  }
-}
+  'where `newsletters`.`status` = ?)) and `members`.`status` = ?)';
 
 const Member = ghostBookshelf.Model.extend(
   {
@@ -513,15 +486,11 @@ const Member = ghostBookshelf.Model.extend(
 
     // Fires with the fully-built knex query (filters/order/limit/offset
     // applied, select columns not yet); the count query runs before this
-    // event, so pagination meta is unaffected. Apply the hint after the
-    // deferred join rewrite so it only matches shallow pages.
+    // event, so pagination meta is unaffected by the rewrite
     onFetchingCollection: function onFetchingCollection(collection, columns, options) {
       ghostBookshelf.Model.prototype.onFetchingCollection.apply(this, arguments);
 
       applyDeferredJoinForDeepOffset(options.query);
-      if (options.hintFreeSubscriberPage === true) {
-        hintFreeSubscriberPage(options.query, columns);
-      }
     },
 
     onDestroyed: function onDestroyed(model, options) {
@@ -701,10 +670,70 @@ const Member = ghostBookshelf.Model.extend(
       }
 
       if (methodName === 'findPage') {
-        options.push('hintFreeSubscriberPage');
+        options.push('activeNewsletterIds');
       }
 
       return options;
+    },
+
+    async findPage(options = {}) {
+      const knex = ghostBookshelf.knex;
+      if (
+        options.filter !== FREE_SUBSCRIBER_FILTER ||
+        options.search ||
+        options.skipPagination ||
+        options.limit === 'all' ||
+        options.transacting ||
+        !['mysql', 'mysql2'].includes(knex.client.config.client)
+      ) {
+        return ghostBookshelf.Model.findPage.call(this, options);
+      }
+
+      // Newsletter status and membership must come from the same snapshot.
+      return knex.transaction(
+        async (transacting) => {
+          const activeNewsletterIds = await transacting('newsletters')
+            .where({ status: 'active' })
+            .pluck('id');
+          return ghostBookshelf.Model.findPage.call(this, {
+            ...options,
+            transacting,
+            activeNewsletterIds,
+          });
+        },
+        { isolationLevel: 'repeatable read' },
+      );
+    },
+
+    getFilteredCollection(options) {
+      const collection = ghostBookshelf.Model.getFilteredCollection.call(this, options);
+      if (!options.activeNewsletterIds) {
+        return collection;
+      }
+
+      const query = collection.query();
+      const { sql, bindings } = query.toSQL();
+      // Preserve the original filter if the compiler or an additional constraint
+      // produces any other query. The rewrite applies to the count and page.
+      if (
+        sql === FREE_SUBSCRIBER_SQL &&
+        bindings[0] === 0 &&
+        bindings[1] === 'active' &&
+        bindings[2] === 'free'
+      ) {
+        const membership = ghostBookshelf
+          .knex('members_newsletters')
+          .select(ghostBookshelf.knex.raw('1'))
+          .whereColumn('members_newsletters.member_id', 'members.id')
+          .whereIn('members_newsletters.newsletter_id', options.activeNewsletterIds);
+        query
+          .clear('where')
+          .where('members.email_disabled', false)
+          .where('members.status', 'free')
+          .whereExists(membership);
+      }
+
+      return collection;
     },
 
     add(data, unfilteredOptions = {}) {
