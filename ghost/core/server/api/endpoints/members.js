@@ -68,9 +68,7 @@ const controller = {
       },
     },
     async query(frame) {
-      const page = await membersService.api.memberBREADService.browse(
-        restrictAdminApiQueryOptions(frame.options),
-      );
+      const page = await membersService.browse(restrictAdminApiQueryOptions(frame.options));
 
       return page;
     },

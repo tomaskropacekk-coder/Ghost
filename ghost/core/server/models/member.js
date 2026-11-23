@@ -81,6 +81,40 @@ function applyDeferredJoinForDeepOffset(qb) {
     .innerJoin(idSubquery.as('deep_page'), 'members.id', 'deep_page.deep_page_id');
 }
 
+// The Admin filter `(subscribed:true+email_disabled:0)+status:free` compiles
+// to this single newsletter subquery. Match the whole page query so a change
+// in SQL shape leaves MySQL's default plan in place.
+const FREE_SUBSCRIBER_PAGE_SQL =
+  'select * from `members` where ((`members`.`email_disabled` = ? and `members`.`id` in (' +
+  'select `members_newsletters`.`member_id` from `members_newsletters` ' +
+  'inner join `newsletters` on `newsletters`.`id` = `members_newsletters`.`newsletter_id` ' +
+  'where `newsletters`.`status` = ?)) and `members`.`status` = ?) ' +
+  'order by `members`.`created_at` DESC limit ?';
+
+function hintFreeSubscriberPage(qb, columns) {
+  if (
+    columns?.length !== 1 ||
+    columns[0] !== 'members.*' ||
+    !['mysql', 'mysql2'].includes(qb.client.config.client)
+  ) {
+    return;
+  }
+
+  const { sql, bindings } = qb.toSQL();
+  const [emailDisabled, newsletterStatus, memberStatus, limit] = bindings;
+  if (
+    (sql === FREE_SUBSCRIBER_PAGE_SQL || sql === FREE_SUBSCRIBER_PAGE_SQL + ' offset ?') &&
+    emailDisabled === 0 &&
+    newsletterStatus === 'active' &&
+    memberStatus === 'free' &&
+    Number.isInteger(limit) &&
+    limit > 0 &&
+    limit <= 100
+  ) {
+    qb.hintComment('NO_SEMIJOIN(@`select#2`)');
+  }
+}
+
 const Member = ghostBookshelf.Model.extend(
   {
     tableName: 'members',
@@ -479,11 +513,15 @@ const Member = ghostBookshelf.Model.extend(
 
     // Fires with the fully-built knex query (filters/order/limit/offset
     // applied, select columns not yet); the count query runs before this
-    // event, so pagination meta is unaffected by the rewrite
+    // event, so pagination meta is unaffected. Apply the hint after the
+    // deferred join rewrite so it only matches shallow pages.
     onFetchingCollection: function onFetchingCollection(collection, columns, options) {
       ghostBookshelf.Model.prototype.onFetchingCollection.apply(this, arguments);
 
       applyDeferredJoinForDeepOffset(options.query);
+      if (options.hintFreeSubscriberPage === true) {
+        hintFreeSubscriberPage(options.query, columns);
+      }
     },
 
     onDestroyed: function onDestroyed(model, options) {
@@ -660,6 +698,10 @@ const Member = ghostBookshelf.Model.extend(
 
       if (['findPage', 'findAll'].includes(methodName)) {
         options = options.concat(['search']);
+      }
+
+      if (methodName === 'findPage') {
+        options.push('hintFreeSubscriberPage');
       }
 
       return options;

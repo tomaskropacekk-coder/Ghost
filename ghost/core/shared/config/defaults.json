@@ -304,6 +304,9 @@
     "maxLimit": 100,
     "allowLimitAll": false,
     "capListingLimit": false,
+    "members": {
+      "hintFreeSubscriberPage": false
+    },
     "getHelper": {
       "timeout": {
         "threshold": 5000,
