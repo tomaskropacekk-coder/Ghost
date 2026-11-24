@@ -235,7 +235,19 @@ describe('Members API — exportCSV', function () {
           }
         }, /Second batch failed/);
         await started;
-        await agent.get(exportUrl).expectStatus(429);
+        const referenceQueries = [];
+        const captureReferenceReads = ({ sql }) => {
+          if (sql.includes('from `products`') || sql.includes('from `labels`')) {
+            referenceQueries.push(sql);
+          }
+        };
+        knex.on('query', captureReferenceReads);
+        try {
+          await agent.get(exportUrl).expectStatus(429);
+          assert.deepEqual(referenceQueries, []);
+        } finally {
+          knex.off('query', captureReferenceReads);
+        }
         rejectSecondBatch(new Error('Second batch failed'));
         await streamFailed;
         await snapshotClosed;

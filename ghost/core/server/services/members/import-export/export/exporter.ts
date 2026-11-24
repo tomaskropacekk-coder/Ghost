@@ -160,10 +160,29 @@ export default class MembersCSVExporter {
   }
 
   async export(options: ExportOptions = {}): Promise<Readable> {
+    const filtered = Boolean(options.filter || options.search);
+    const batched = filtered && this._members.canReadFilteredBatches(options);
+    if (!batched) {
+      return this.startExport(options, filtered, false);
+    }
+
+    if (this.snapshotExportRunning) {
+      throw new errors.TooManyRequestsError({
+        message: 'A filtered member export is already running. Try again after it finishes.',
+      });
+    }
+    this.snapshotExportRunning = true;
+    try {
+      return await this.startExport(options, filtered, true);
+    } catch (error) {
+      this.snapshotExportRunning = false;
+      throw error;
+    }
+  }
+
+  private async startExport(options: ExportOptions, filtered: boolean, batched: boolean) {
     const start = Date.now();
     const reference = await this.fetchReferenceData();
-    const filtered = options.filter || options.search;
-    const batched = filtered && this._members.canReadFilteredBatches(options);
     const ids = filtered && !batched ? await this._members.findFilteredIds(options) : null;
 
     logging.info(
@@ -194,7 +213,13 @@ export default class MembersCSVExporter {
     // small export that fits in the buffer still counts as broken off if its download is.
     const streamed = (
       snapshot
-        ? pipeline(Readable.from(snapshot.batches), processingTransform).finally(snapshot.close)
+        ? pipeline(Readable.from(snapshot.batches), processingTransform).finally(async () => {
+            try {
+              await snapshot.close();
+            } finally {
+              this.snapshotExportRunning = false;
+            }
+          })
         : pipeline(
             this._knex('members')
               .select(...MEMBER_COLUMNS)
@@ -230,23 +255,10 @@ export default class MembersCSVExporter {
   private async openFilteredSnapshot(options: ExportOptions) {
     // Keep the matching set stable across the download. Related reads use the
     // same connection so concurrent exports never wait for a second pool slot.
-    if (this.snapshotExportRunning) {
-      throw new errors.TooManyRequestsError({
-        message: 'A filtered member export is already running. Try again after it finishes.',
-      });
-    }
-    this.snapshotExportRunning = true;
-    let transaction: Knex.Transaction | undefined;
-    const close = async () => {
-      try {
-        await transaction?.rollback();
-      } finally {
-        this.snapshotExportRunning = false;
-      }
-    };
+    const transaction = await this._knex.transaction({ isolationLevel: 'repeatable read' });
+    const close = () => transaction.rollback();
 
     try {
-      transaction = await this._knex.transaction({ isolationLevel: 'repeatable read' });
       const read = await this._members.openFilteredBatchReader(options, transaction);
       const firstBatch = await read(MEMBER_COLUMNS, BATCH_SIZE);
       const batches = (async function* () {
