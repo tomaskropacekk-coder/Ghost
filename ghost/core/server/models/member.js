@@ -686,23 +686,28 @@ const Member = ghostBookshelf.Model.extend(
       );
     },
 
+    canOptimizeFreeSubscriberFilter(options) {
+      return (
+        options.filter === FREE_SUBSCRIBER_FILTER &&
+        !options.search &&
+        ['mysql', 'mysql2'].includes(ghostBookshelf.knex.client.config.client)
+      );
+    },
+
+    async activeNewsletterIds(transacting) {
+      return transacting('newsletters').where({ status: 'active' }).pluck('id');
+    },
+
     withActiveNewsletterIds(options, read) {
       const knex = ghostBookshelf.knex;
-      if (
-        options.filter !== FREE_SUBSCRIBER_FILTER ||
-        options.search ||
-        options.transacting ||
-        !['mysql', 'mysql2'].includes(knex.client.config.client)
-      ) {
+      if (!this.canOptimizeFreeSubscriberFilter(options) || options.transacting) {
         return read(options);
       }
 
       // Newsletter status and membership must come from the same snapshot.
       return knex.transaction(
         async (transacting) => {
-          const activeNewsletterIds = await transacting('newsletters')
-            .where({ status: 'active' })
-            .pluck('id');
+          const activeNewsletterIds = await this.activeNewsletterIds(transacting);
           return read({ ...options, transacting, activeNewsletterIds });
         },
         { isolationLevel: 'repeatable read' },

@@ -85,12 +85,9 @@ function createSiteExporter() {
     // Same shape the `/db/` download produces, so the file stays importable
     exportContent: async () => ({ db: [await exporter.doExport()] }),
     exportMembersCSV: async () =>
-      toCSVStream(
-        'members',
-        await membersService.export({ limit: 'all' }),
-        createMembersCSVTransform(),
-      ),
-    // Same restricted-fields guard the `/posts/export/` endpoint applies
+      toCSVStream('members', await membersService.export(), createMembersCSVTransform()),
+    // Pass limit: 'all' to keep the post export from stopping at its default page size.
+    // Apply the same restricted-fields guard as the `/posts/export/` endpoint.
     exportPostAnalyticsCSV: async () =>
       toCSVStream(
         'post analytics',

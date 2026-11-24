@@ -30,7 +30,8 @@ async function changeIndex(knex: Knex, table: string, columns: string[], action:
 
   const name = `${table}_${columns.join('_')}_index`;
   const [existing] = await knex.raw('SHOW INDEX FROM ?? WHERE Key_name = ?', [table, name]);
-  if (Boolean(existing.length) === (action === 'add')) {
+  const exists = existing.length > 0;
+  if (action === 'add' ? exists : !exists) {
     logging.info(`Skipping ${action} of index ${name}`);
     return;
   }

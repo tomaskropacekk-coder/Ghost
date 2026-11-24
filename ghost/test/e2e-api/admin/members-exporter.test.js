@@ -149,6 +149,13 @@ describe('Members API — exportCSV', function () {
           memberReads.push(query);
         }
       };
+      const openSnapshot = models.Member.activeNewsletterIds;
+      models.Member.activeNewsletterIds = async function (transaction) {
+        const ids = await openSnapshot.call(this, transaction);
+        await knex('newsletters').where('id', active[0].id).update({ status: 'archived' });
+        await knex('members_newsletters').where('member_id', batch.at(-1).id).del();
+        return ids;
+      };
       knex.on('query', capture);
       let res;
       try {
@@ -156,7 +163,9 @@ describe('Members API — exportCSV', function () {
           .get(`/members/upload/?filter=${encodeURIComponent(filter)}`)
           .expectStatus(200);
       } finally {
+        models.Member.activeNewsletterIds = openSnapshot;
         knex.off('query', capture);
+        await knex('newsletters').where('id', active[0].id).update({ status: 'active' });
       }
 
       const csv = Papa.parse(res.text, { header: true, skipEmptyLines: true });
@@ -173,6 +182,68 @@ describe('Members API — exportCSV', function () {
           (query) => query.sql.endsWith('limit ?') && query.bindings.at(-1) === 1000,
         ),
       );
+      const search = await agent.get('/members/upload/?search=filtered-export-').expectStatus(200);
+      const searchRows = Papa.parse(search.text, { header: true, skipEmptyLines: true });
+      assert.deepEqual(searchRows.errors, []);
+      assert.deepEqual(
+        searchRows.data.map((row) => row.id).sort(),
+        batch.map((row) => row.id).sort(),
+      );
+
+      const exportUrl = `/members/upload/?filter=${encodeURIComponent(filter)}`;
+      const { export: exportMembers } = require('../../../core/server/services/members');
+      const buildQuery = models.Member.getFilteredCollectionQuery;
+      let snapshotClosed;
+      let secondBatchStarted;
+      const started = new Promise((resolve) => {
+        secondBatchStarted = resolve;
+      });
+      let rejectSecondBatch;
+      const failed = new Promise((_, reject) => {
+        rejectSecondBatch = reject;
+      });
+      failed.catch(() => {});
+      models.Member.getFilteredCollectionQuery = function (...args) {
+        snapshotClosed = args[0].transacting.executionPromise;
+        const query = buildQuery.apply(this, args);
+        const clone = query.clone.bind(query);
+        let batches = 0;
+        query.clone = () => {
+          const batchQuery = clone();
+          batches += 1;
+          if (batches === 2) {
+            batchQuery.limit = () => {
+              secondBatchStarted();
+              return failed;
+            };
+          }
+          return batchQuery;
+        };
+        return query;
+      };
+      try {
+        const stream = await exportMembers({
+          filter,
+          mongoTransformer: require('@tryghost/nql').utils.mapKeyValues({
+            key: { from: 'subscribed', to: 'newsletters.status' },
+            values: [{ from: true, to: 'active' }],
+          }),
+        });
+        const streamFailed = assert.rejects(async () => {
+          for await (const row of stream) {
+            assert.ok(row.id);
+          }
+        }, /Second batch failed/);
+        await started;
+        await agent.get(exportUrl).expectStatus(429);
+        rejectSecondBatch(new Error('Second batch failed'));
+        await streamFailed;
+        await snapshotClosed;
+      } finally {
+        rejectSecondBatch(new Error('Second batch failed'));
+        models.Member.getFilteredCollectionQuery = buildQuery;
+      }
+      await agent.get(exportUrl).expectStatus(200);
     } finally {
       await knex('members')
         .whereIn(
