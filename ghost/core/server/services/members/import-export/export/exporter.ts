@@ -1,5 +1,5 @@
 import moment from 'moment';
-import { Transform, type Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { finished, pipeline } from 'node:stream/promises';
 import type { Knex } from 'knex';
 import { csvCellsForFields, type CsvField } from '@tryghost/metafield-csv';
@@ -27,10 +27,14 @@ export interface MetafieldsService {
   valuesForMembers(memberIds: string[]): Promise<Map<string, MemberValues>>;
 }
 
-// The members aggregate, narrowed to the one read the export makes: the ids matching
-// a filter, resolved without any of the related data the stream fetches itself.
+// The members aggregate applies the same filter and search rules as Admin browse.
 export interface MembersRepository {
-  findFilteredIds(options: ExportOptions): Promise<string[]>;
+  findFilteredBatch(
+    options: ExportOptions,
+    columns: Array<keyof MemberDbRow>,
+    limit: number,
+    afterId?: string,
+  ): Promise<MemberDbRow[]>;
 }
 
 export interface ExporterDeps {
@@ -154,37 +158,32 @@ export default class MembersCSVExporter {
 
   async export(options: ExportOptions = {}): Promise<Readable> {
     const start = Date.now();
-    const hasFilter = options.limit !== 'all' || options.filter || options.search;
-    const ids = hasFilter ? await this._members.findFilteredIds(options) : null;
-    if (ids) {
-      logging.info(
-        { event: { name: 'members-export.filtered' }, matched: ids.length },
-        'Found members matching the export filter',
-      );
-    }
-
     const reference = await this.fetchReferenceData();
-
-    const membersQuery = this._knex('members').select(...MEMBER_COLUMNS);
-    if (ids) {
-      membersQuery.whereIn('id', ids);
-    }
+    const filteredBatches =
+      options.filter || options.search ? await this.readFilteredBatches(options) : null;
 
     logging.info(
       { event: { name: 'members-export.started' } },
       'Starting streaming export of members',
     );
     const attempt = this._tracking.export(reference.activeMetafields);
-    const batchingTransform = this.createBatchingTransform();
     const processingTransform = this.createProcessingTransform(reference, (rows) =>
       attempt.wrote(rows),
     );
 
     // Over once the reader has taken every row, not once the last one is buffered for it, so a
     // small export that fits in the buffer still counts as broken off if its download is.
-    const streamed = pipeline(membersQuery.stream(), batchingTransform, processingTransform).then(
-      () => finished(processingTransform),
-    );
+    const streamed = (
+      filteredBatches
+        ? pipeline(Readable.from(filteredBatches), processingTransform)
+        : pipeline(
+            this._knex('members')
+              .select(...MEMBER_COLUMNS)
+              .stream(),
+            this.createBatchingTransform(),
+            processingTransform,
+          )
+    ).then(() => finished(processingTransform));
     streamed.then(
       () =>
         logging.info(
@@ -197,6 +196,24 @@ export default class MembersCSVExporter {
     attempt.ended(streamed);
 
     return processingTransform;
+  }
+
+  private async readFilteredBatches(options: ExportOptions) {
+    const findBatch = (afterId?: string) =>
+      this._members.findFilteredBatch(options, MEMBER_COLUMNS, BATCH_SIZE, afterId);
+
+    // Run the first batch before returning a stream so bad filters still return an API error.
+    const firstBatch = await findBatch();
+    return (async function* () {
+      let batch = firstBatch;
+      while (batch.length > 0) {
+        yield batch;
+        if (batch.length < BATCH_SIZE) {
+          return;
+        }
+        batch = await findBatch(batch[batch.length - 1].id);
+      }
+    })();
   }
 
   // products and labels are small, stable tables, read once up front as id->name
@@ -273,7 +290,7 @@ export default class MembersCSVExporter {
 
     return new Transform({
       objectMode: true,
-      highWaterMark: BATCH_SIZE,
+      writableHighWaterMark: 1,
       async transform(batch: MemberDbRow[], encoding, callback) {
         try {
           const memberIds = batch.map((member) => member.id);

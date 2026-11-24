@@ -115,6 +115,74 @@ describe('Members API — exportCSV', function () {
     mockManager.restore();
   });
 
+  it('exports filtered members in bounded batches without duplicating subscriptions', async function () {
+    const filter = '(subscribed:true+email_disabled:0)+status:free';
+    const active = newsletters.filter((newsletter) => newsletter.get('status') === 'active');
+    const batch = Array.from({ length: 1001 }, (_, i) => ({
+      id: models.Base.Model.generateId(),
+      email: `filtered-export-${i}@example.com`,
+      uuid: crypto.randomUUID(),
+      transient_id: crypto.randomUUID(),
+      created_at: '2025-01-01 00:00:00',
+    }));
+    const knex = db.knex;
+    await knex.batchInsert('members', batch, 100);
+    try {
+      await knex.batchInsert(
+        'members_newsletters',
+        batch.map(({ id }) => ({
+          id: models.Base.Model.generateId(),
+          member_id: id,
+          newsletter_id: active[0].id,
+        })),
+        100,
+      );
+      await knex('members_newsletters').insert({
+        id: models.Base.Model.generateId(),
+        member_id: batch[0].id,
+        newsletter_id: active[1].id,
+      });
+
+      const memberReads = [];
+      const capture = (query) => {
+        if (query.sql.startsWith('select') && query.sql.includes(' from `members`')) {
+          memberReads.push(query);
+        }
+      };
+      knex.on('query', capture);
+      let res;
+      try {
+        res = await agent
+          .get(`/members/upload/?filter=${encodeURIComponent(filter)}`)
+          .expectStatus(200);
+      } finally {
+        knex.off('query', capture);
+      }
+
+      const csv = Papa.parse(res.text, { header: true, skipEmptyLines: true });
+      assert.deepEqual(csv.errors, []);
+      assert.deepEqual(
+        csv.data.map((row) => row.id),
+        batch.map((row) => row.id).sort(),
+      );
+      assert.equal(memberReads.length, 2);
+      assert.ok(memberReads[0].sql.includes('exists (select 1 from `members_newsletters`'));
+      assert.ok(memberReads[1].sql.includes('`members`.`id` > ?'));
+      assert.ok(
+        memberReads.every(
+          (query) => query.sql.endsWith('limit ?') && query.bindings.at(-1) === 1000,
+        ),
+      );
+    } finally {
+      await knex('members')
+        .whereIn(
+          'id',
+          batch.map((row) => row.id),
+        )
+        .del();
+    }
+  });
+
   it('Can export tiers', async function () {
     // Create a new member with a product (to be renamed to "tiers" once the changes is done on model layer)
     const member = await createMember({

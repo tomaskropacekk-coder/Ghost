@@ -84,9 +84,6 @@ function createSiteExporter() {
   return new SiteExporter({
     // Same shape the `/db/` download produces, so the file stays importable
     exportContent: async () => ({ db: [await exporter.doExport()] }),
-    // `limit: 'all'` keeps both CSV exporters on their unfiltered
-    // streaming path — without it the members exporter materialises every
-    // id into a WHERE IN and the posts exporter caps at its default page
     exportMembersCSV: async () =>
       toCSVStream(
         'members',

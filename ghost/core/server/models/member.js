@@ -676,17 +676,25 @@ const Member = ghostBookshelf.Model.extend(
       return options;
     },
 
-    async findPage(options = {}) {
+    findPage(options = {}) {
+      if (options.skipPagination || options.limit === 'all') {
+        return ghostBookshelf.Model.findPage.call(this, options);
+      }
+
+      return this.withActiveNewsletterIds(options, (queryOptions) =>
+        ghostBookshelf.Model.findPage.call(this, queryOptions),
+      );
+    },
+
+    withActiveNewsletterIds(options, read) {
       const knex = ghostBookshelf.knex;
       if (
         options.filter !== FREE_SUBSCRIBER_FILTER ||
         options.search ||
-        options.skipPagination ||
-        options.limit === 'all' ||
         options.transacting ||
         !['mysql', 'mysql2'].includes(knex.client.config.client)
       ) {
-        return ghostBookshelf.Model.findPage.call(this, options);
+        return read(options);
       }
 
       // Newsletter status and membership must come from the same snapshot.
@@ -695,11 +703,7 @@ const Member = ghostBookshelf.Model.extend(
           const activeNewsletterIds = await transacting('newsletters')
             .where({ status: 'active' })
             .pluck('id');
-          return ghostBookshelf.Model.findPage.call(this, {
-            ...options,
-            transacting,
-            activeNewsletterIds,
-          });
+          return read({ ...options, transacting, activeNewsletterIds });
         },
         { isolationLevel: 'repeatable read' },
       );

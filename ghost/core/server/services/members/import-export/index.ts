@@ -159,7 +159,7 @@ export function makeImporter(deps: ImporterServices) {
 }
 
 // Build the members CSV exporter. The same composition root from the other direction:
-// knex and the members id lookup are wired here, and the metafields definitions and
+// knex and the filtered member reads are wired here, and the metafields definitions and
 // values services are injected (boot builds them before this one).
 export function makeExporter({
   definitions,
@@ -169,17 +169,18 @@ export function makeExporter({
     knex: db.knex,
 
     members: {
-      // Minimal query, only to fetch the ids of the filtered members; the stream
-      // reads their related data itself.
-      findFilteredIds: async (options) => {
-        const page = await models.Member.findPage({
-          ...options,
-          withRelated: [],
-          columns: ['id'],
-          limit: 'all',
-        });
-        return page.data.map((member: { id: string }) => member.id);
-      },
+      findFilteredBatch: (options, columns, limit, afterId) =>
+        models.Member.withActiveNewsletterIds(options, (queryOptions: ExportOptions) => {
+          const filterOptions = models.Member.filterOptions(queryOptions, 'findPage');
+          const query: Knex.QueryBuilder = models.Member.getFilteredCollectionQuery(filterOptions);
+          if (afterId !== undefined) {
+            query.where('members.id', '>', afterId);
+          }
+          return query
+            .select(columns.map((column) => `members.${column}`))
+            .orderBy('members.id')
+            .limit(limit);
+        }),
     },
 
     metafields: {
